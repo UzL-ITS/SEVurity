@@ -1,0 +1,7 @@
+The modified linux kernels in the host-kernels directory are licensed
+as stated in the respective "COPYING" file.
+
+The code in the the "tweak-tools" directory is licensed under GPL-v2
+
+The code int the "gadget-injection-victim" and "userland" directory is
+licensed under MIT.
