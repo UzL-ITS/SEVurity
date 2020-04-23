@@ -34,7 +34,7 @@ This is the attack described in Section IV.B of the paper.
 4. Compile the kernel with "/my-make-kernel.sh" and install it on the host system. On subsequent changes you only need to recompile the KVM kernel module. This can be done with "my-make-kvm-modules.sh".
 
 ### Attack
-1. Run the "userland/do-load-<kernel version>-plaintext.sh" script. This will populate the known plaintext database in the kernel module.
+1. Run the "userland/do-load-{kernel version}-plaintext.sh" script. This will populate the known plaintext database in the kernel module.
 
 2. Start the VM with the launch-qemu.sh script provided by AMD[3].
 
@@ -56,7 +56,7 @@ This is the attack from Section VI of the paper.
 4. Compile the kernel with "/my-make-kernel.sh" and install it on the host system. On subsequent changes you only need to recompile the KVM kernel module. This can be done with "my-make-kvm-modules.sh".
 
 ### Attack
-1. Run the "userland/do-load-<kernel version>-plaintext.sh" script. This will populate the known plaintext database in the kernel module.
+1. Run the "userland/do-load-{kernel version}-plaintext.sh" script. This will populate the known plaintext database in the kernel module.
 
 2. Start the VM with the launch-qemu.sh script provided by AMD[3].
 
