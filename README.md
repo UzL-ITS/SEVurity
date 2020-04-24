@@ -96,6 +96,6 @@ The following is a broad overview of the changes the kernel.
 
 # References
 - [1] https://doi.ieeecomputersociety.org/10.1109/SP40000.2020.00080
-- [2] Added soon
+- [2] http://arxiv.org/abs/2004.11071
 - [3] https://github.com/AMDESE/AMDSEV
 - [4] http://fivelinesofcode.blogspot.com/2014/03/how-to-translate-virtual-to-physical.html
