@@ -46,6 +46,7 @@ typedef struct {
   uint32_t type;               // 1 = counter gadget; 2 = stack detect gadget
   uint8_t waiting_for_fault;   // indicates to page fault handler we are looking
                                // for write page faults
+  void * stack_page_pre_write; //page fault handler copies suspected stack page, before resuming the fault
 
   uint64_t tmp_fault_gpa;
   uint64_t fault_gpa; // gets filled with latest write page fault by page fault
@@ -102,4 +103,8 @@ bool __inject_code(struct kvm *kvm, gpa_t gpa_target, uint8_t *code,
 bool simple_inject_code(struct kvm *kvm, inject_param_t *injp);
 bool nf_simple_inject_code(struct kvm *kvm, inject_param_t *injp,
                            void *mapping);
+
+bool nf_simple_inject_code_precalc(struct kvm *kvm, inject_param_t *injp,
+		void * buffer);
+bool nf_buffered_inject(struct kvm *kvm, inject_param_t *injp, void * buffer, void *mapping);
 #endif

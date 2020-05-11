@@ -170,9 +170,9 @@ bool db_entry_finalize(gpa_t gpa, hfn_t hfn, uint8_t *ciphertext) {
 
   db_entry = db_get(gpa);
   if (db_entry == NULL) {
-    printk("in %s line %d db_entry_finalize: did not find entry for "
+    /*printk("in %s line %d db_entry_finalize: did not find entry for "
            "gpa=%016llx. max db gfn is %016llx\n",
-           __FILE__, __LINE__, gpa,db_count);
+           __FILE__, __LINE__, gpa,db_count);*/
     return false;
   }
 
@@ -296,7 +296,7 @@ int __find_source_for_move(hpa_t target, __u8 *wanted_plaintext, int length,
 	    }
 	  }
   }
-  printk("found %016llx valid entries a 16 bytes\n",valid_entries);
+  //printk("found %016llx valid entries a 16 bytes\n",valid_entries);
   ////end debug
 
   // test cached entries first

